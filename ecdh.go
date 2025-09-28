@@ -1,28 +1,27 @@
 package crypto_go
 
 import (
-	"crypto/elliptic"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
-	"math/big"
 )
 
 // ECDH handles ECDH operations with string inputs/outputs.
 type ECDH struct {
-	privateKey *big.Int
-	publicX    *big.Int
-	publicY    *big.Int
-	curve      elliptic.Curve
+	privateKey *ecdh.PrivateKey
+	publicKey  *ecdh.PublicKey
+	curve      ecdh.Curve
 }
 
 // NewECDH creates a new ECDH instance.
 // If privKeyBase64 is empty, a random key is generated.
 func NewECDH(privKeyBase64 string) (*ECDH, error) {
-	curve := elliptic.P256()
-	var priv *big.Int
-	var x, y *big.Int
+	curve := ecdh.P256()
+
+	var priv *ecdh.PrivateKey
+	var pub *ecdh.PublicKey
 	var err error
 
 	if privKeyBase64 != "" {
@@ -30,66 +29,49 @@ func NewECDH(privKeyBase64 string) (*ECDH, error) {
 		if err != nil {
 			return nil, err
 		}
-		priv = new(big.Int).SetBytes(privBytes)
-		x, y = curve.ScalarBaseMult(priv.Bytes())
-	} else {
-		priv, x, y, err = generateKey(curve)
+		priv, err = curve.NewPrivateKey(privBytes)
 		if err != nil {
 			return nil, err
 		}
+		pub = priv.PublicKey()
+	} else {
+		priv, err = curve.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		pub = priv.PublicKey()
 	}
 
 	return &ECDH{
 		privateKey: priv,
-		publicX:    x,
-		publicY:    y,
+		publicKey:  pub,
 		curve:      curve,
 	}, nil
 }
 
-func generateKey(curve elliptic.Curve) (*big.Int, *big.Int, *big.Int, error) {
-	privBytes, x, y, err := elliptic.GenerateKey(curve, rand.Reader)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	priv := new(big.Int).SetBytes(privBytes)
-	return priv, x, y, nil
-}
-
-// PublicKey returns the base64-encoded concatenated public key "X||Y".
+// PublicKey returns the base64-encoded raw public key bytes.
 func (e *ECDH) PublicKey() string {
-	xBytes := e.publicX.Bytes()
-	yBytes := e.publicY.Bytes()
-
-	// pad to ensure fixed length for decoding
-	keyLen := (e.curve.Params().BitSize + 7) / 8
-	xPadded := leftPad(xBytes, keyLen)
-	yPadded := leftPad(yBytes, keyLen)
-
-	return base64.StdEncoding.EncodeToString(append(xPadded, yPadded...))
+	return base64.StdEncoding.EncodeToString(e.publicKey.Bytes())
 }
 
 // SharedSecret computes a base64-encoded shared secret given a remote public key.
 func (e *ECDH) SharedSecret(remotePub string) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(remotePub)
+	remoteBytes, err := base64.StdEncoding.DecodeString(remotePub)
 	if err != nil {
 		return "", err
 	}
 
-	keyLen := (e.curve.Params().BitSize + 7) / 8
-	if len(data) != 2*keyLen {
-		return "", errors.New("invalid public key length")
+	remoteKey, err := e.curve.NewPublicKey(remoteBytes)
+	if err != nil {
+		return "", errors.New("invalid remote public key")
 	}
 
-	x := new(big.Int).SetBytes(data[:keyLen])
-	y := new(big.Int).SetBytes(data[keyLen:])
-
-	if !e.curve.IsOnCurve(x, y) {
-		return "", errors.New("public key is not on curve")
+	secret, err := e.privateKey.ECDH(remoteKey)
+	if err != nil {
+		return "", err
 	}
 
-	secretX, _ := e.curve.ScalarMult(x, y, e.privateKey.Bytes())
-	hash := sha256.Sum256(secretX.Bytes())
+	hash := sha256.Sum256(secret)
 	return base64.StdEncoding.EncodeToString(hash[:]), nil
 }
 
@@ -98,12 +80,82 @@ func (e *ECDH) PrivateKey() string {
 	return base64.StdEncoding.EncodeToString(e.privateKey.Bytes())
 }
 
-// leftPad ensures byte slices are fixed length
-func leftPad(b []byte, length int) []byte {
-	if len(b) >= length {
-		return b
+// Encrypt encrypts a message using an ephemeral keypair and the recipient's public key.
+// Returns base64(ephemeralPub || ciphertext).
+func (e *ECDH) Encrypt(remotePub string, message string) (string, error) {
+	remoteBytes, err := base64.StdEncoding.DecodeString(remotePub)
+	if err != nil {
+		return "", err
 	}
-	padded := make([]byte, length)
-	copy(padded[length-len(b):], b)
-	return padded
+
+	remoteKey, err := e.curve.NewPublicKey(remoteBytes)
+	if err != nil {
+		return "", errors.New("invalid remote public key")
+	}
+
+	// Generate ephemeral key
+	ephemeralPriv, err := e.curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", err
+	}
+	ephemeralPub := ephemeralPriv.PublicKey().Bytes()
+
+	// Derive shared secret
+	secret, err := ephemeralPriv.ECDH(remoteKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Hash to AES key
+	key := sha256.Sum256(secret)
+	aes := NewAES(string(key[:])) // use your AES struct
+
+	// Encrypt with AES
+	ct, err := aes.Encrypt(message)
+	if err != nil {
+		return "", err
+	}
+
+	// Bundle ephemeral pubkey + AES ciphertext
+	final := append(ephemeralPub, []byte(ct)...)
+	return base64.StdEncoding.EncodeToString(final), nil
+}
+
+// Decrypt decrypts a message encrypted with Encrypt().
+func (e *ECDH) Decrypt(ciphertextB64 string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return "", err
+	}
+
+	pubLen := len(e.publicKey.Bytes())
+	if len(data) <= pubLen {
+		return "", errors.New("invalid ciphertext length")
+	}
+
+	ephemeralPubBytes := data[:pubLen]
+	ciphertextPart := string(data[pubLen:]) // stored as string (AES ciphertext b64)
+
+	ephemeralKey, err := e.curve.NewPublicKey(ephemeralPubBytes)
+	if err != nil {
+		return "", errors.New("invalid ephemeral public key")
+	}
+
+	// Derive shared secret
+	secret, err := e.privateKey.ECDH(ephemeralKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Hash to AES key
+	key := sha256.Sum256(secret)
+	aes := NewAES(string(key[:]))
+
+	// Decrypt using AES
+	plaintext, err := aes.Decrypt(ciphertextPart)
+	if err != nil {
+		return "", err
+	}
+
+	return plaintext, nil
 }
