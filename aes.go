@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -27,6 +28,13 @@ func NewAES(password string) *AES {
 	} else {
 		hash := sha256.Sum256([]byte(password))
 		key = hash[:]
+	}
+	return &AES{key: key}
+}
+
+func NewAESFromKey(key []byte) *AES {
+	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
+		panic(fmt.Sprintf("invalid AES key size: %d (must be 16, 24, or 32 bytes)", len(key)))
 	}
 	return &AES{key: key}
 }
